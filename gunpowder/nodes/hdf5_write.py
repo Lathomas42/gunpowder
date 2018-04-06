@@ -1,32 +1,34 @@
 import logging
 import os
-
+from multiprocessing import Manager
 from .batch_filter import BatchFilter
 from gunpowder.batch_request import BatchRequest
 from gunpowder.ext import h5py
+from gunpowder.coordinate import Coordinate
 
 logger = logging.getLogger(__name__)
 
+
 class Hdf5Write(BatchFilter):
-    '''Assemble arrays of passing batches in one HDF5 file. This is useful to 
-    store chunks produced by :class:`Scan` on disk without keeping the larger 
-    array in memory. The ROIs of the passing arrays will be used to determine 
+    '''Assemble arrays of passing batches in one HDF5 file. This is useful to
+    store chunks produced by :class:`Scan` on disk without keeping the larger
+    array in memory. The ROIs of the passing arrays will be used to determine
     the position where to store the data in the dataset.
 
     Args:
 
-        dataset_names (dict): A dictionary from :class:`ArrayKey` to names of 
+        dataset_names (dict): A dictionary from :class:`ArrayKey` to names of
             the datasets to store them in.
 
-        output_dir (string): The directory to save the HDF5 file. Will be 
+        output_dir (string): The directory to save the HDF5 file. Will be
             created, if it does not exist.
 
         output_filename (string): The output filename.
 
-        compression_type (string or int): Compression strategy.  Legal values 
-            are 'gzip', 'szip', 'lzf'.  If an integer in range(10), this 
-            indicates gzip compression level. Otherwise, an integer indicates 
-            the number of a dynamically loaded compression filter. (See 
+        compression_type (string or int): Compression strategy.  Legal values
+            are 'gzip', 'szip', 'lzf'.  If an integer in range(10), this
+            indicates gzip compression level. Otherwise, an integer indicates
+            the number of a dynamically loaded compression filter. (See
             h5py.groups.create_dataset())
 
         dataset_dtypes (dict): A dictionary from :class:`ArrayKey` to datatype
@@ -41,72 +43,69 @@ class Hdf5Write(BatchFilter):
             output_filename='output.hdf',
             compression_type=None,
             dataset_dtypes=None):
-
         self.dataset_names = dataset_names
         self.output_dir = output_dir
         self.output_filename = output_filename
+        # first cleanup the file
+        fn = os.path.join(self.output_dir, self.output_filename)
+        try:
+            os.remove(fn)
+        except:
+            pass
+
         self.compression_type = compression_type
         if dataset_dtypes is None:
             self.dataset_dtypes = {}
         else:
             self.dataset_dtypes = dataset_dtypes
-        self.file = None
 
-    def create_output_file(self, batch):
+        self.m = Manager()
+        self.f_lock = self.m.Lock()
 
-        try:
-            os.makedirs(self.output_dir)
-        except:
-            pass
+    def create_output_file(self):
+        with self.f_lock:
+            try:
+                os.makedirs(self.output_dir)
+            except:
+                pass
+            _file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'a')
+            for (array_key, dataset_name) in self.dataset_names.items():
 
-        self.file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'w')
-        self.datasets = {}
+                logger.debug("Create dataset for %s", array_key)
 
-        for (array_key, dataset_name) in self.dataset_names.items():
+                total_roi = self.spec[array_key].roi
+                dims = total_roi.dims()
 
-            logger.debug("Create dataset for %s", array_key)
+                # extends of spatial dimensions
+                data_shape = total_roi.get_shape()//self.spec[array_key].voxel_size
+                logger.debug("Shape in voxels: %s", data_shape)
+                # add channel dimensions (if present)
+                data_shape = Coordinate([3])[:] + data_shape
+                logger.debug("Shape with channel dimensions: %s", data_shape)
 
-            assert array_key in self.spec, (
-                "Asked to store %s, but is not provided upstream."%array_key)
-            assert array_key in batch.arrays, (
-                "Asked to store %s, but is not part of batch."%array_key)
+                print self.spec
+                if array_key in self.dataset_dtypes:
+                    dtype = self.dataset_dtypes[array_key]
+                else:
+                    dtype = self.spec[array_key].dtype
+                dataset = _file.create_dataset(
+                        name=dataset_name,
+                        shape=data_shape,
+                        compression=self.compression_type,
+                        dtype=dtype)
+                dataset.attrs['offset'] = total_roi.get_offset()
+                dataset.attrs['resolution'] = self.spec[array_key].voxel_size
+            _file.close()
 
-            batch_shape = batch.arrays[array_key].data.shape
+    def setup(self):
+        fn = os.path.join(self.output_dir, self.output_filename)
+        if not os.path.exists(fn):
+            self.create_output_file()
 
-            total_roi = self.spec[array_key].roi
-            dims = total_roi.dims()
-
-            # extends of spatial dimensions
-            data_shape = total_roi.get_shape()//self.spec[array_key].voxel_size
-            logger.debug("Shape in voxels: %s", data_shape)
-            # add channel dimensions (if present)
-            data_shape = batch_shape[:-dims] + data_shape
-            logger.debug("Shape with channel dimensions: %s", data_shape)
-
-            if array_key in self.dataset_dtypes:
-                dtype = self.dataset_dtypes[array_key]
-            else:
-                dtype = batch.arrays[array_key].data.dtype
-
-            dataset = self.file.create_dataset(
-                    name=dataset_name,
-                    shape=data_shape,
-                    compression=self.compression_type,
-                    dtype=dtype)
-
-            dataset.attrs['offset'] = total_roi.get_offset()
-            dataset.attrs['resolution'] = self.spec[array_key].voxel_size
-
-            self.datasets[array_key] = dataset
 
     def process(self, batch, request):
-
-        if self.file is None:
-            logger.info("Creating HDF file...")
-            self.create_output_file(batch)
-
-        for array_key, dataset in self.datasets.items():
-
+        for array_key, dataset_name in self.dataset_names.items():
+            print "array_key %s" %array_key
             roi = batch.arrays[array_key].spec.roi
             data = batch.arrays[array_key].data
             total_roi = self.spec[array_key].roi
@@ -117,8 +116,12 @@ class Hdf5Write(BatchFilter):
 
             data_roi = (roi - total_roi.get_offset())//self.spec[array_key].voxel_size
             dims = data_roi.dims()
-            channel_slices = (slice(None),)*max(0, len(dataset.shape) - dims)
-            voxel_slices = data_roi.get_bounding_box()
 
-            dataset[channel_slices + voxel_slices] = batch.arrays[array_key].data
-
+            with self.f_lock:
+                _file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'a')
+                channel_slices = (slice(None),)*max(0, len(_file[dataset_name].shape) - dims)
+                voxel_slices = data_roi.get_bounding_box()
+                logger.info("CS: %s VS: %s %s"%(channel_slices,voxel_slices,(_file[dataset_name][channel_slices + voxel_slices]).size))
+                logger.info("OUT SIZE: %s"%batch.arrays[array_key].data.size)
+                _file[dataset_name][channel_slices + voxel_slices] = batch.arrays[array_key].data
+                _file.close()
