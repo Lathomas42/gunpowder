@@ -46,13 +46,6 @@ class Hdf5Write(BatchFilter):
         self.dataset_names = dataset_names
         self.output_dir = output_dir
         self.output_filename = output_filename
-        # first cleanup the file
-        fn = os.path.join(self.output_dir, self.output_filename)
-        try:
-            os.remove(fn)
-        except:
-            pass
-
         self.compression_type = compression_type
         if dataset_dtypes is None:
             self.dataset_dtypes = {}
@@ -79,11 +72,10 @@ class Hdf5Write(BatchFilter):
                 # extends of spatial dimensions
                 data_shape = total_roi.get_shape()//self.spec[array_key].voxel_size
                 logger.debug("Shape in voxels: %s", data_shape)
-                # add channel dimensions (if present)
+                # add channel dimensions (HACK: Unsure how to get channels)
                 data_shape = Coordinate([3])[:] + data_shape
                 logger.debug("Shape with channel dimensions: %s", data_shape)
 
-                print self.spec
                 if array_key in self.dataset_dtypes:
                     dtype = self.dataset_dtypes[array_key]
                 else:
@@ -105,7 +97,6 @@ class Hdf5Write(BatchFilter):
 
     def process(self, batch, request):
         for array_key, dataset_name in self.dataset_names.items():
-            print "array_key %s" %array_key
             roi = batch.arrays[array_key].spec.roi
             data = batch.arrays[array_key].data
             total_roi = self.spec[array_key].roi
@@ -121,7 +112,5 @@ class Hdf5Write(BatchFilter):
                 _file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'a')
                 channel_slices = (slice(None),)*max(0, len(_file[dataset_name].shape) - dims)
                 voxel_slices = data_roi.get_bounding_box()
-                logger.info("CS: %s VS: %s %s"%(channel_slices,voxel_slices,(_file[dataset_name][channel_slices + voxel_slices]).size))
-                logger.info("OUT SIZE: %s"%batch.arrays[array_key].data.size)
                 _file[dataset_name][channel_slices + voxel_slices] = batch.arrays[array_key].data
                 _file.close()
