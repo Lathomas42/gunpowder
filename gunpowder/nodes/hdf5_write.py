@@ -1,12 +1,38 @@
 import logging
 import os
-from multiprocessing import Manager
+from multiprocessing import Manager,Queue
 from .batch_filter import BatchFilter
 from gunpowder.batch_request import BatchRequest
 from gunpowder.ext import h5py
 from gunpowder.coordinate import Coordinate
 
 logger = logging.getLogger(__name__)
+
+from collections import namedtuple
+from threading import Thread, Event
+
+WriteRequest=namedtuple("WriteRequest","dset position data")
+
+def BG_Write_Thread_func(file_name, request_queue, stopEvent):
+        logger.info("Thread started with fn %s"%file_name)
+        _file = h5py.File(file_name, 'a')
+
+        # keep looping until we are supposed to stop
+        while not stopEvent.isSet():
+            if not request_queue.empty():
+                logger.info("Emptying Queue")
+                while not request_queue.empty():
+                    req = request_queue.get()
+                    _file[req.dset][req.position] = req.data
+        # event was set
+        # make sure there was no race condition and no stragglers
+        while not request_queue.empty():
+            logger.info("A few left in Queue")
+            req = request_queue.get()
+            _file[req.dset][req.position] = req.data
+
+        _file.close()
+
 
 
 class Hdf5Write(BatchFilter):
@@ -52,47 +78,58 @@ class Hdf5Write(BatchFilter):
         else:
             self.dataset_dtypes = dataset_dtypes
 
-        self.m = Manager()
-        self.f_lock = self.m.Lock()
+        self.dataset_shapes = {}
+
+        self.bg_thread=None
+        self.queue = Queue(maxsize=50)
+        self.stopEvent=Event()
 
     def create_output_file(self):
-        with self.f_lock:
-            try:
-                os.makedirs(self.output_dir)
-            except:
-                pass
-            _file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'a')
-            for (array_key, dataset_name) in self.dataset_names.items():
+        try:
+            os.makedirs(self.output_dir)
+        except:
+            pass
+        _file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'a')
+        for (array_key, dataset_name) in self.dataset_names.items():
 
-                logger.debug("Create dataset for %s", array_key)
+            logger.debug("Create dataset for %s", array_key)
 
-                total_roi = self.spec[array_key].roi
-                dims = total_roi.dims()
+            total_roi = self.spec[array_key].roi
+            dims = total_roi.dims()
 
-                # extends of spatial dimensions
-                data_shape = total_roi.get_shape()//self.spec[array_key].voxel_size
-                logger.debug("Shape in voxels: %s", data_shape)
-                # add channel dimensions (HACK: Unsure how to get channels)
-                data_shape = Coordinate([3])[:] + data_shape
-                logger.debug("Shape with channel dimensions: %s", data_shape)
+            # extends of spatial dimensions
+            data_shape = total_roi.get_shape()//self.spec[array_key].voxel_size
+            logger.debug("Shape in voxels: %s", data_shape)
+            # add channel dimensions (HACK: Unsure how to get channels)
+            data_shape = Coordinate([3])[:] + data_shape
+            logger.debug("Shape with channel dimensions: %s", data_shape)
 
-                if array_key in self.dataset_dtypes:
-                    dtype = self.dataset_dtypes[array_key]
-                else:
-                    dtype = self.spec[array_key].dtype
-                dataset = _file.create_dataset(
-                        name=dataset_name,
-                        shape=data_shape,
-                        compression=self.compression_type,
-                        dtype=dtype)
-                dataset.attrs['offset'] = total_roi.get_offset()
-                dataset.attrs['resolution'] = self.spec[array_key].voxel_size
-            _file.close()
+            if array_key in self.dataset_dtypes:
+                dtype = self.dataset_dtypes[array_key]
+            else:
+                dtype = self.spec[array_key].dtype
+            dataset = _file.create_dataset(
+                    name=dataset_name,
+                    shape=data_shape,
+                    compression=self.compression_type,
+                    dtype=dtype)
+            self.dataset_shapes[dataset_name] = data_shape
+            dataset.attrs['offset'] = total_roi.get_offset()
+            dataset.attrs['resolution'] = self.spec[array_key].voxel_size
+        _file.close()
 
     def setup(self):
         fn = os.path.join(self.output_dir, self.output_filename)
         if not os.path.exists(fn):
             self.create_output_file()
+        self.stopEvent.clear()
+        logger.info("starting thread")
+        self.bg_thread = Thread(target=BG_Write_Thread_func, args=(fn,self.queue,self.stopEvent))
+        self.bg_thread.start()
+
+    def teardown(self):
+        self.stopEvent.set()
+        self.bg_thread.join()
 
 
     def process(self, batch, request):
@@ -107,10 +144,8 @@ class Hdf5Write(BatchFilter):
 
             data_roi = (roi - total_roi.get_offset())//self.spec[array_key].voxel_size
             dims = data_roi.dims()
-
-            with self.f_lock:
-                _file = h5py.File(os.path.join(self.output_dir, self.output_filename), 'a')
-                channel_slices = (slice(None),)*max(0, len(_file[dataset_name].shape) - dims)
-                voxel_slices = data_roi.get_bounding_box()
-                _file[dataset_name][channel_slices + voxel_slices] = batch.arrays[array_key].data
-                _file.close()
+            channel_slices = (slice(None),)*max(0, len(self.dataset_shapes[dataset_name]) - dims)
+            voxel_slices = data_roi.get_bounding_box()
+            req = WriteRequest(dset=dataset_name,position=channel_slices + voxel_slices, data=batch.arrays[array_key].data)
+            #this will hang if the queue is full
+            self.queue.put(req)
